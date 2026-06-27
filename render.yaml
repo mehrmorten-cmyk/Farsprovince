@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: fars-news-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PERSONAL_CHANNEL_ID
+        sync: false
+      - key: ADMIN_CHAT_IDS
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
