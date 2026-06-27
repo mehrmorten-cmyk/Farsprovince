@@ -71,11 +71,36 @@ app = Flask(__name__)
 # Database
 # ============================================================
 
+_db_lock = threading.Lock()
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
+
+
+def db_write(sql, params=(), script=False):
+    """Thread-safe database write with retry."""
+    with _db_lock:
+        for attempt in range(3):
+            try:
+                conn = get_db()
+                if script:
+                    conn.executescript(sql)
+                else:
+                    conn.execute(sql, params)
+                    conn.commit()
+                conn.close()
+                return True
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e) and attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                log.error(f"DB write error: {e}")
+                return False
+    return False
 
 
 def init_db():
@@ -156,13 +181,14 @@ def get_setting(key, default=""):
 
 
 def set_setting(key, value):
-    conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        (key, str(value)),
-    )
-    conn.commit()
-    conn.close()
+    with _db_lock:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, str(value)),
+        )
+        conn.commit()
+        conn.close()
 
 
 # ============================================================
@@ -214,9 +240,9 @@ def reply_to_admin(chat_id, text, reply_markup=None):
 # ============================================================
 
 def google_news_search(keyword, max_results=20):
-    """Search Google News RSS for Persian keyword."""
+    """Search Google News RSS for Persian keyword (last 24 hours)."""
     encoded = quote(keyword)
-    url = f"https://news.google.com/rss/search?q={encoded}&hl=fa&gl=IR&ceid=IR:fa"
+    url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=fa&gl=IR&ceid=IR:fa"
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
@@ -241,9 +267,9 @@ def google_news_search(keyword, max_results=20):
 
 
 def google_news_search_en(keyword, max_results=15):
-    """Search Google News RSS for English keyword."""
+    """Search Google News RSS for English keyword (last 24 hours)."""
     encoded = quote(keyword)
-    url = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
+    url = f"https://news.google.com/rss/search?q={encoded}+when:1d&hl=en&gl=US&ceid=US:en"
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
@@ -274,7 +300,7 @@ def google_x_search(keyword, max_results=10):
     """
     if not ENABLE_X_SEARCH:
         return []
-    encoded = quote(f"{keyword} site:x.com OR site:twitter.com")
+    encoded = quote(f"{keyword} site:x.com OR site:twitter.com when:1d")
     url = f"https://news.google.com/rss/search?q={encoded}&hl=fa&gl=IR&ceid=IR:fa"
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -376,6 +402,7 @@ def gemini_filter_articles(articles):
         article_texts.append(
             f"[{i}] Title: {art['title']}\n"
             f"    Source: {art.get('source', '?')}\n"
+            f"    Date: {art.get('pub_date', '?')}\n"
             f"    Description: {desc}"
         )
 
@@ -392,6 +419,7 @@ def gemini_filter_articles(articles):
 
 ۳. مقالاتی که فقط به «خبرگزاری فارس» اشاره دارند ولی درباره استان فارس نیستند را رد کن.
 ۴. مقالات ملی/بین‌المللی که ربطی به استان فارس ندارند را رد کن.
+۵. فقط اخبار جدید (۲۴ ساعت اخیر) را بپذیر. اخبار قدیمی‌تر از ۲ روز را رد کن.
 
 مقالات:
 {articles_block}
@@ -634,31 +662,35 @@ def check_smart_sources():
 
         log.info(f"Batch {i // 15 + 1}: {len(relevant)} relevant out of {len(batch)}")
 
-        conn = get_db()
         for art in relevant:
             # Send raw article with inline rewrite button
             result = send_article_with_button(art)
 
             # Mark as seen
-            conn.execute(
-                "INSERT OR IGNORE INTO seen_articles (link_hash, link, title, source) VALUES (?, ?, ?, ?)",
-                (art["link_hash"], art["link"], art.get("title_fa", ""), art.get("source", "")),
-            )
+            with _db_lock:
+                conn = get_db()
+                conn.execute(
+                    "INSERT OR IGNORE INTO seen_articles (link_hash, link, title, source) VALUES (?, ?, ?, ?)",
+                    (art["link_hash"], art["link"], art.get("title_fa", ""), art.get("source", "")),
+                )
+                conn.commit()
+                conn.close()
 
             if result:
                 total_sent += 1
 
         # Mark filtered-out articles as seen too (no duplicates)
         relevant_hashes = {a["link_hash"] for a in relevant}
-        for art in batch:
-            if art["link_hash"] not in relevant_hashes:
-                conn.execute(
-                    "INSERT OR IGNORE INTO seen_articles (link_hash, link, title, source) VALUES (?, ?, ?, ?)",
-                    (art["link_hash"], art["link"], art.get("title", ""), art.get("source", "")),
-                )
-
-        conn.commit()
-        conn.close()
+        with _db_lock:
+            conn = get_db()
+            for art in batch:
+                if art["link_hash"] not in relevant_hashes:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO seen_articles (link_hash, link, title, source) VALUES (?, ?, ?, ?)",
+                        (art["link_hash"], art["link"], art.get("title", ""), art.get("source", "")),
+                    )
+            conn.commit()
+            conn.close()
 
         if i + 15 < len(new_articles):
             time.sleep(2)
@@ -708,14 +740,15 @@ def send_article_with_button(art):
     # Save to sent_messages for later rewriting
     if result.get("ok"):
         msg_id = result["result"]["message_id"]
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO sent_messages (link_hash, chat_id, message_id, title_fa, summary_fa, category, link, source) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (link_hash, CHANNEL_ID, msg_id, title, summary, cat, link, source),
-        )
-        conn.commit()
-        conn.close()
+        with _db_lock:
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO sent_messages (link_hash, chat_id, message_id, title_fa, summary_fa, category, link, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (link_hash, CHANNEL_ID, msg_id, title, summary, cat, link, source),
+            )
+            conn.commit()
+            conn.close()
         return True
 
     return False
@@ -805,10 +838,11 @@ def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash):
     edit_message(chat_id, message_id, rewritten_caption)
 
     # Mark as rewritten
-    conn = get_db()
-    conn.execute("UPDATE sent_messages SET rewritten = 1 WHERE link_hash = ?", (link_hash,))
-    conn.commit()
-    conn.close()
+    with _db_lock:
+        conn = get_db()
+        conn.execute("UPDATE sent_messages SET rewritten = 1 WHERE link_hash = ?", (link_hash,))
+        conn.commit()
+        conn.close()
 
     log.info(f"Rewritten article: {row['title_fa'][:50]}")
 
@@ -819,11 +853,12 @@ def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash):
 
 def cleanup_old_records():
     """Clean up old records (>7 days) to keep DB small."""
-    conn = get_db()
-    conn.execute("DELETE FROM seen_articles WHERE seen_at < datetime('now', '-7 days')")
-    conn.execute("DELETE FROM sent_messages WHERE sent_at < datetime('now', '-7 days')")
-    conn.commit()
-    conn.close()
+    with _db_lock:
+        conn = get_db()
+        conn.execute("DELETE FROM seen_articles WHERE seen_at < datetime('now', '-7 days')")
+        conn.execute("DELETE FROM sent_messages WHERE sent_at < datetime('now', '-7 days')")
+        conn.commit()
+        conn.close()
     log.info("Old records cleaned up.")
 
 
