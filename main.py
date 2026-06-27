@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ربات خبریابی هوشمند استان فارس — نسخه ۱
-Fars Province Smart News Bot v1 — Built by Viktor
+ربات خبریابی هوشمند استان فارس — نسخه ۲
+Fars Province Smart News Bot v2 — Built by Viktor
 
 Features:
 - Smart Search: Google News RSS + Google X/Twitter search
@@ -391,6 +391,46 @@ def check_all_web_sources():
 # Gemini AI — Relevance Filter
 # ============================================================
 
+def _parse_gemini_json(text):
+    """Parse Gemini JSON with repair for common LLM mistakes."""
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to extract JSON block from markdown fences
+    import re
+    m = re.search(r"```json?\s*(.*?)\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find the outermost { ... }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        snippet = text[start : end + 1]
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            pass
+        # Attempt common repairs
+        repaired = snippet
+        repaired = re.sub(r",\s*}", "}", repaired)       # trailing comma before }
+        repaired = re.sub(r",\s*]", "]", repaired)        # trailing comma before ]
+        repaired = re.sub(r'"\s*\n\s*"', '",\n"', repaired)  # missing comma between strings
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+    log.error(f"Gemini JSON parse failed after repair: {text[:200]}")
+    return None
+
+
 def gemini_filter_articles(articles):
     """Use Gemini AI to filter articles relevant to Fars province."""
     if not GEMINI_API_KEY or not articles:
@@ -459,7 +499,9 @@ def gemini_filter_articles(articles):
 
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(text)
+        result = _parse_gemini_json(text)
+        if result is None:
+            return []
 
         relevant = []
         for item in result.get("results", []):
@@ -561,7 +603,9 @@ def gemini_rewrite_single(title_fa, summary_fa, link, source, category):
 
         data = resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(text)
+        result = _parse_gemini_json(text)
+        if result is None:
+            return None
         hashtags = result.get("hashtags", [])
         return {
             "title_rewritten": result.get("title_rewritten", title_fa),
