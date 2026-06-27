@@ -837,6 +837,8 @@ def is_admin(chat_id):
 
 def handle_command(chat_id, text):
     """Handle bot commands from admin."""
+    global ENABLE_X_SEARCH, CHANNEL_ID, CHECK_INTERVAL
+
     if not is_admin(chat_id):
         send_message(chat_id, "⛔ فقط ادمین‌ها می‌توانند از این ربات استفاده کنند.")
         return
@@ -983,7 +985,6 @@ def handle_command(chat_id, text):
 
         # ---- X/Twitter Commands ----
         elif command == "/xon":
-            global ENABLE_X_SEARCH
             ENABLE_X_SEARCH = True
             reply_to_admin(chat_id, "🐦 جستجوی ایکس/توییتر فعال شد.")
 
@@ -1007,7 +1008,6 @@ def handle_command(chat_id, text):
             if not arg:
                 reply_to_admin(chat_id, f"🆔 کانال فعلی: <code>{CHANNEL_ID}</code>\nبرای تغییر: /set_channel شناسه_کانال")
                 return
-            global CHANNEL_ID
             CHANNEL_ID = arg
             reply_to_admin(chat_id, f"✅ کانال مقصد تغییر کرد: <code>{arg}</code>\n⚠️ PERSONAL_CHANNEL_ID را در Render آپدیت کنید.")
 
@@ -1015,7 +1015,6 @@ def handle_command(chat_id, text):
             if not arg or not arg.isdigit():
                 reply_to_admin(chat_id, f"⏱ فاصله فعلی: {CHECK_INTERVAL} ثانیه\nبرای تغییر: /set_interval 600")
                 return
-            global CHECK_INTERVAL
             CHECK_INTERVAL = max(60, int(arg))
             reply_to_admin(chat_id, f"✅ فاصله بررسی: {CHECK_INTERVAL} ثانیه")
 
