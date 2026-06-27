@@ -215,6 +215,19 @@ def send_message(chat_id, text, parse_mode="HTML", reply_markup=None):
     return tg_request("sendMessage", **params)
 
 
+def send_photo(chat_id, photo_url, caption="", parse_mode="HTML", reply_markup=None):
+    """Send a photo with caption to Telegram."""
+    params = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption[:1024],
+        "parse_mode": parse_mode,
+    }
+    if reply_markup:
+        params["reply_markup"] = reply_markup
+    return tg_request("sendPhoto", **params)
+
+
 def edit_message(chat_id, message_id, text, parse_mode="HTML", reply_markup=None):
     params = {
         "chat_id": chat_id,
@@ -498,7 +511,12 @@ def gemini_filter_articles(articles):
             return []
 
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = data.get("candidates", [])
+        if not candidates:
+            reason = data.get("promptFeedback", {}).get("blockReason", "unknown")
+            log.error(f"Gemini filter blocked: {reason}")
+            return []
+        text = candidates[0]["content"]["parts"][0]["text"]
         result = _parse_gemini_json(text)
         if result is None:
             return []
@@ -580,8 +598,11 @@ def gemini_rewrite_single(title_fa, summary_fa, link, source, category):
 {{
   "title_rewritten": "عنوان بازنویسی‌شده (کوتاه و جذاب، حداکثر ۱۵ کلمه)",
   "body_rewritten": "متن بازنویسی‌شده (۳-۵ جمله، با فرهنگ مقاومت، لحن ایمن اینستاگرام، بدون واژگان ممنوعه)",
-  "hashtags": ["هشتگ۱", "هشتگ۲", "هشتگ۳"]
-}}"""
+  "hashtags": ["هشتگ۱", "هشتگ۲", "هشتگ۳"],
+  "is_urgent": false
+}}
+
+نکته: اگر خبر فوری یا بسیار مهم است (مثل بازداشت، اعدام، حوادث طبیعی، تظاهرات) مقدار is_urgent را true بگذار."""
 
     try:
         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -602,7 +623,12 @@ def gemini_rewrite_single(title_fa, summary_fa, link, source, category):
             return None
 
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidates = data.get("candidates", [])
+        if not candidates:
+            reason = data.get("promptFeedback", {}).get("blockReason", "unknown")
+            log.error(f"Gemini rewrite blocked: {reason}")
+            return None
+        text = candidates[0]["content"]["parts"][0]["text"]
         result = _parse_gemini_json(text)
         if result is None:
             return None
@@ -611,6 +637,7 @@ def gemini_rewrite_single(title_fa, summary_fa, link, source, category):
             "title_rewritten": result.get("title_rewritten", title_fa),
             "body_rewritten": result.get("body_rewritten", summary_fa),
             "hashtags": " ".join(f"#{h.replace('#', '')}" for h in hashtags) if hashtags else "",
+            "is_urgent": result.get("is_urgent", False),
         }
 
     except Exception as e:
@@ -744,8 +771,31 @@ def check_smart_sources():
     return total_sent
 
 
+def extract_image_url(link):
+    """Extract the main image (og:image) from an article URL."""
+    try:
+        resp = requests.get(link, timeout=10, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.text[:50000], "html.parser")
+        # Try og:image first (most reliable)
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            return og["content"]
+        # Try twitter:image
+        tw = soup.find("meta", attrs={"name": "twitter:image"})
+        if tw and tw.get("content"):
+            return tw["content"]
+        return None
+    except Exception as e:
+        log.debug(f"Image extraction failed for {link[:60]}: {e}")
+        return None
+
+
 def send_article_with_button(art):
-    """Send a raw article to the channel with an inline 'rewrite' button."""
+    """Send a raw article to the channel with an inline 'rewrite' button. Includes image if available."""
     category_emoji = {
         "سیاسی": "🏛", "اجتماعی": "👥", "اقتصادی": "💰",
         "فرهنگی": "🎭", "حوادث": "🚨", "ورزشی": "⚽",
@@ -779,7 +829,16 @@ def send_article_with_button(art):
         ]
     }
 
-    result = send_message(CHANNEL_ID, caption, reply_markup=reply_markup)
+    # Try to extract and send image
+    image_url = extract_image_url(link)
+    result = None
+    if image_url:
+        result = send_photo(CHANNEL_ID, image_url, caption=caption, reply_markup=reply_markup)
+        if not result.get("ok"):
+            log.debug(f"Photo send failed, falling back to text: {result}")
+            result = None
+    if not result or not result.get("ok"):
+        result = send_message(CHANNEL_ID, caption, reply_markup=reply_markup)
 
     # Save to sent_messages for later rewriting
     if result.get("ok"):
@@ -818,12 +877,71 @@ def handle_callback(callback_query):
 
     if data.startswith("rewrite:"):
         link_hash = data[8:]
-        handle_rewrite_callback(callback_id, chat_id, message_id, link_hash)
+        handle_rewrite_callback(callback_id, chat_id, message_id, link_hash, message=message)
     else:
         answer_callback(callback_id, "❓ دستور ناشناخته")
 
 
-def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash):
+def _parse_article_from_message(message):
+    """Fallback: extract article data from the Telegram message text when DB is empty (e.g. after redeploy)."""
+    import re
+    text = message.get("text", "") or ""
+    # Also check caption for media messages
+    if not text:
+        text = message.get("caption", "") or ""
+    
+    # Extract title — first bold line after header
+    title = ""
+    lines = text.split("\n")
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped not in ("🔍 خبر استان فارس",) and not stripped.startswith(("🏛", "👥", "💰", "🎭", "🚨", "⚽", "🏥", "🌿", "📰")):
+            if not stripped.startswith("🔗"):
+                title = stripped
+                break
+    
+    # Extract link
+    link = ""
+    # Check entities for URLs
+    entities = message.get("entities", []) or message.get("caption_entities", [])
+    for ent in entities:
+        if ent.get("type") == "text_link":
+            link = ent.get("url", "")
+            break
+    # Fallback: regex
+    if not link:
+        m = re.search(r'https?://[^\s<>"]+', text)
+        if m:
+            link = m.group(0)
+    
+    # Extract summary — everything between title and link
+    summary = ""
+    if title and link:
+        idx_title = text.find(title)
+        idx_link = text.rfind("🔗")
+        if idx_title >= 0 and idx_link > idx_title:
+            summary = text[idx_title + len(title):idx_link].strip()
+    
+    # Extract source & category from the header line
+    source = ""
+    category = ""
+    for line in lines:
+        if "🌐" in line:
+            m = re.search(r"🌐\s*(.+)", line)
+            if m:
+                source = m.group(1).strip()
+        for cat_name in ("سیاسی", "اجتماعی", "اقتصادی", "فرهنگی", "حوادث", "ورزشی", "سلامت", "محیط‌زیست"):
+            if cat_name in line:
+                category = cat_name
+                break
+    
+    return {
+        "title_fa": title, "summary_fa": summary, "link": link,
+        "source": source, "category": category,
+    }
+
+
+def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash, message=None):
     """Handle rewrite button press — rewrite article with protocol."""
     # Acknowledge immediately
     answer_callback(callback_id, "⏳ در حال بازنویسی با پروتکل مقاومت...")
@@ -836,26 +954,39 @@ def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash):
     ).fetchone()
     conn.close()
 
-    if not row:
+    # Fallback: parse article data from the message itself (handles DB wipe after redeploy)
+    if not row and message:
+        parsed = _parse_article_from_message(message)
+        if parsed.get("title_fa") and parsed.get("link"):
+            log.info(f"DB miss for {link_hash[:12]}… — falling back to message text")
+            row = parsed
+        else:
+            edit_message(chat_id, message_id, "❌ مقاله یافت نشد.")
+            return
+    elif not row:
         edit_message(chat_id, message_id, "❌ مقاله یافت نشد.")
         return
 
-    if row["rewritten"]:
-        # Already rewritten — just notify
+    # Check if already rewritten (only works with DB row)
+    if isinstance(row, sqlite3.Row) and row["rewritten"]:
         answer_callback(callback_id, "✅ قبلاً بازنویسی شده.")
         return
 
+    title_fa = row["title_fa"] if isinstance(row, sqlite3.Row) else row.get("title_fa", "")
+    summary_fa = row["summary_fa"] if isinstance(row, sqlite3.Row) else row.get("summary_fa", "")
+    link = row["link"] if isinstance(row, sqlite3.Row) else row.get("link", "")
+    source = row["source"] if isinstance(row, sqlite3.Row) else row.get("source", "")
+    category = row["category"] if isinstance(row, sqlite3.Row) else row.get("category", "")
+
     # Call Gemini for rewriting
-    result = gemini_rewrite_single(
-        row["title_fa"], row["summary_fa"], row["link"], row["source"], row["category"],
-    )
+    result = gemini_rewrite_single(title_fa, summary_fa, link, source, category)
 
     if not result:
         edit_message(
             chat_id, message_id,
             f"❌ خطا در بازنویسی. متن اصلی:\n\n"
-            f"<b>{row['title_fa']}</b>\n\n{row['summary_fa']}\n\n"
-            f'🔗 <a href="{row["link"]}">مشاهده خبر کامل</a>',
+            f"<b>{title_fa}</b>\n\n{summary_fa}\n\n"
+            f'🔗 <a href="{link}">مشاهده خبر کامل</a>',
         )
         return
 
@@ -864,31 +995,40 @@ def handle_rewrite_callback(callback_id, chat_id, message_id, link_hash):
         "فرهنگی": "🎭", "حوادث": "🚨", "ورزشی": "⚽",
         "سلامت": "🏥", "محیط‌زیست": "🌿",
     }
-    cat = row["category"] or ""
+    cat = category or ""
     emoji = category_emoji.get(cat, "📰")
     hashtags = result.get("hashtags", "")
+    is_urgent = result.get("is_urgent", False)
+
+    # Distinctive rewritten format
+    if is_urgent:
+        header = "🔴 <b>خبر فوری استان فارس</b> 🔴"
+    else:
+        header = "✊ <b>خبر استان فارس — بازنویسی مقاومت</b>"
 
     rewritten_caption = (
-        f"✊ <b>خبر استان فارس — بازنویسی مقاومت</b>\n"
-        f"{emoji} <b>{cat}</b> | 🌐 {row['source']}\n\n"
-        f"<b>{result['title_rewritten']}</b>\n\n"
-        f"{result['body_rewritten']}"
+        f"{header}\n"
+        f"{'━' * 25}\n"
+        f"{emoji} <b>{cat}</b> | 🌐 {source}\n\n"
+        f"📌 <b>{result['title_rewritten']}</b>\n\n"
+        f"{result['body_rewritten']}\n\n"
+        f"{'━' * 25}"
     )
     if hashtags:
-        rewritten_caption += f"\n\n{hashtags}"
-    rewritten_caption += f'\n\n🔗 <a href="{row["link"]}">مشاهده خبر کامل</a>'
+        rewritten_caption += f"\n{hashtags}"
+    rewritten_caption += f'\n\n🔗 <a href="{link}">مشاهده خبر کامل</a>'
 
     # Edit the message — remove the button
     edit_message(chat_id, message_id, rewritten_caption)
 
-    # Mark as rewritten
+    # Mark as rewritten in DB (if row existed)
     with _db_lock:
         conn = get_db()
         conn.execute("UPDATE sent_messages SET rewritten = 1 WHERE link_hash = ?", (link_hash,))
         conn.commit()
         conn.close()
 
-    log.info(f"Rewritten article: {row['title_fa'][:50]}")
+    log.info(f"Rewritten article: {title_fa[:50]}")
 
 
 # ============================================================
